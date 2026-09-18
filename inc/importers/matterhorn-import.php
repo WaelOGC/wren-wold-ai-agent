@@ -2193,3 +2193,195 @@ function fashion_brand_theme_matterhorn_existing_map( array $product_ids ) {
 	return $map;
 }
 
+/**
+ * Read-only: stream the Matterhorn XML feed and return up to $quantity products
+ * matching a canonical category slug (e.g. dresses). Does not create Woo products.
+ *
+ * @param string $category Canonical or chat-facing category name.
+ * @param int    $quantity Max number of grouped products to return.
+ * @return array{items:array<int,array<string,mixed>>,found:int,requested_category:string,requested_quantity:int}|WP_Error
+ */
+function fashion_brand_theme_matterhorn_preview_category_items( $category, $quantity ) {
+	$quantity = max( 0, (int) $quantity );
+	$slugs    = fashion_brand_theme_matterhorn_normalize_preview_category( $category );
+
+	if ( empty( $slugs ) || $quantity < 1 ) {
+		return array(
+			'items'              => array(),
+			'found'              => 0,
+			'requested_category' => (string) $category,
+			'requested_quantity' => $quantity,
+		);
+	}
+
+	$slug_lookup = array_fill_keys( $slugs, true );
+	$feed        = fashion_brand_theme_matterhorn_feed_path();
+
+	if ( ! file_exists( $feed ) ) {
+		return new WP_Error(
+			'matterhorn_feed_missing',
+			sprintf( 'Feed not found at %s.', $feed )
+		);
+	}
+
+	$reader = new XMLReader();
+
+	if ( ! $reader->open( $feed, null, LIBXML_NONET | LIBXML_COMPACT ) ) {
+		return new WP_Error( 'matterhorn_feed_unreadable', 'Could not open feed with XMLReader.' );
+	}
+
+	$groups = array();
+
+	while ( $reader->read() ) {
+		if ( XMLReader::ELEMENT !== $reader->nodeType || 'product' !== $reader->localName ) {
+			continue;
+		}
+
+		$node_xml = $reader->readOuterXML();
+		if ( '' === $node_xml ) {
+			continue;
+		}
+
+		$data = fashion_brand_theme_matterhorn_parse_product_node( $node_xml );
+		if ( empty( $data['product_id'] ) ) {
+			continue;
+		}
+
+		$category_slug = fashion_brand_theme_matterhorn_map_category_slug( $data['category'] );
+		if ( null === $category_slug || ! isset( $slug_lookup[ $category_slug ] ) ) {
+			continue;
+		}
+
+		$extracted = fashion_brand_theme_matterhorn_extract_style_and_color( $data['code'] );
+		if ( null === $extracted ) {
+			continue;
+		}
+
+		$group_key = fashion_brand_theme_matterhorn_group_key( $data['producer'], $extracted['style_key'] );
+		$desc_key  = fashion_brand_theme_matterhorn_description_key( $data['description'] ?? '' );
+
+		$size_labels = array();
+		foreach ( $data['sizes'] as $size ) {
+			$name = isset( $size['name'] ) ? trim( (string) $size['name'] ) : '';
+			if ( '' === $name ) {
+				continue;
+			}
+			$size_labels[] = array(
+				'name'  => $name,
+				'count' => isset( $size['count'] ) ? (int) $size['count'] : 0,
+			);
+		}
+
+		$variant = array(
+			'id'          => (string) $data['product_id'],
+			'color'       => $extracted['color'],
+			'code'        => (string) $data['code'],
+			'name'        => (string) $data['name'],
+			'price_netto' => (float) $data['price_netto'],
+			'photos'      => is_array( $data['photos'] ) ? $data['photos'] : array(),
+			'sizes'       => $size_labels,
+		);
+
+		if ( ! isset( $groups[ $group_key ] ) ) {
+			$groups[ $group_key ] = array(
+				'id'        => $group_key,
+				'style_key' => $extracted['style_key'],
+				'producer'  => (string) $data['producer'],
+				'category'  => $category_slug,
+				'desc_key'  => $desc_key,
+				'variants'  => array(),
+			);
+		} elseif ( '' === (string) ( $groups[ $group_key ]['desc_key'] ?? '' ) && '' !== $desc_key ) {
+			$groups[ $group_key ]['desc_key'] = $desc_key;
+		}
+
+		$groups[ $group_key ]['variants'][] = $variant;
+		unset( $node_xml, $data );
+	}
+
+	$reader->close();
+
+	$groups = fashion_brand_theme_matterhorn_merge_groups_by_description( $groups );
+	$items  = array();
+
+	foreach ( $groups as $group ) {
+		$variants = isset( $group['variants'] ) && is_array( $group['variants'] ) ? $group['variants'] : array();
+		if ( empty( $variants ) ) {
+			continue;
+		}
+
+		$colors     = array();
+		$all_sizes  = array();
+		$image_urls = array();
+		foreach ( $variants as $variant ) {
+			if ( ! empty( $variant['color'] ) ) {
+				$colors[] = (string) $variant['color'];
+			}
+			foreach ( $variant['sizes'] as $size ) {
+				$all_sizes[ $size['name'] ] = true;
+			}
+			foreach ( $variant['photos'] as $photo ) {
+				$photo = trim( (string) $photo );
+				if ( '' !== $photo ) {
+					$image_urls[] = $photo;
+				}
+			}
+		}
+
+		$first   = $variants[0];
+		$items[] = array(
+			'name'       => fashion_brand_theme_matterhorn_style_display_name( $first['name'], $first['color'] ),
+			'model'      => (string) $group['style_key'],
+			'category'   => (string) $group['category'],
+			'colors'     => array_values( array_unique( $colors ) ),
+			'sizes'      => array_keys( $all_sizes ),
+			'price'      => (float) $first['price_netto'],
+			'image_urls' => array_values( array_unique( $image_urls ) ),
+		);
+
+		if ( count( $items ) >= $quantity ) {
+			break;
+		}
+	}
+
+	return array(
+		'items'              => $items,
+		'found'              => count( $items ),
+		'requested_category' => (string) $category,
+		'requested_quantity' => $quantity,
+	);
+}
+
+/**
+ * Map chat-facing category names to Matterhorn canonical product_cat slug(s).
+ *
+ * @param string $category Category from chat or API.
+ * @return array<int, string>
+ */
+function fashion_brand_theme_matterhorn_normalize_preview_category( $category ) {
+	$key = strtolower( trim( (string) $category ) );
+
+	$map = array(
+		'dresses'  => array( 'dresses' ),
+		'dress'    => array( 'dresses' ),
+		'tops'     => array( 't-shirts', 'shirts' ),
+		'top'      => array( 't-shirts', 'shirts' ),
+		't-shirts' => array( 't-shirts' ),
+		't-shirt'  => array( 't-shirts' ),
+		'shirts'   => array( 'shirts' ),
+		'shirt'    => array( 'shirts' ),
+		'pants'    => array( 'pants' ),
+		'knitwear' => array( 'knitwear' ),
+		'skirts'   => array( 'skirts' ),
+		'skirt'    => array( 'skirts' ),
+		'bags'     => array( 'bags' ),
+		'bag'      => array( 'bags' ),
+	);
+
+	if ( isset( $map[ $key ] ) ) {
+		return $map[ $key ];
+	}
+
+	return '' === $key ? array() : array( $key );
+}
+

@@ -1,6 +1,9 @@
 import json
 import os
 import re
+import urllib.error
+import urllib.parse
+import urllib.request
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -177,12 +180,85 @@ def build_import_request_reply(category: Optional[str]) -> str:
     return "How many items would you like me to import?"
 
 
-def build_import_confirmed_reply(category: Optional[str], quantity: int) -> str:
-    label = category if category else "items"
-    return (
-        f"Got it — I'll import {quantity} {label}. "
-        "Actual import will be built in the next development phase."
+def fetch_matterhorn_feed_items(category: Optional[str], quantity: int) -> dict:
+    """Call the WordPress Ornina REST endpoint to preview Matterhorn feed items."""
+    site_url = (os.getenv("WORDPRESS_SITE_URL") or "").rstrip("/")
+    api_key = os.getenv("WORDPRESS_API_KEY") or ""
+
+    if not site_url:
+        raise RuntimeError("WORDPRESS_SITE_URL is not configured")
+    if not api_key:
+        raise RuntimeError("WORDPRESS_API_KEY is not configured")
+
+    category_param = category or "dresses"
+    query = urllib.parse.urlencode(
+        {
+            "category": category_param,
+            "quantity": int(quantity),
+        }
     )
+    url = f"{site_url}/wp-json/ornina/v1/matterhorn/feed?{query}"
+
+    request = urllib.request.Request(
+        url,
+        headers={
+            "X-API-Key": api_key,
+            "Accept": "application/json",
+        },
+        method="GET",
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            body = response.read().decode("utf-8")
+            status = getattr(response, "status", 200)
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"WordPress feed preview failed ({exc.code}): {detail}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"WordPress feed preview unreachable: {exc.reason}") from exc
+
+    if status < 200 or status >= 300:
+        raise RuntimeError(f"WordPress feed preview failed ({status}): {body}")
+
+    try:
+        data = json.loads(body)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("WordPress feed preview returned invalid JSON") from exc
+
+    if not isinstance(data, dict):
+        raise RuntimeError("WordPress feed preview returned unexpected payload")
+
+    return data
+
+
+def summarize_feed_preview(category: Optional[str], quantity: int, preview: dict) -> str:
+    items = preview.get("items") if isinstance(preview.get("items"), list) else []
+    found = int(preview.get("found") or len(items))
+    label = category if category else "items"
+
+    if found == 0:
+        return f"I couldn't find any {label} in the Matterhorn feed right now."
+
+    lines = []
+    for item in items[:quantity]:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or item.get("model") or "Unknown")
+        price = item.get("price")
+        if isinstance(price, (int, float)):
+            lines.append(f"{name} (€{price:g} cost)")
+        else:
+            lines.append(name)
+
+    listing = "; ".join(lines) if lines else "no details available"
+
+    if found < quantity:
+        return (
+            f"Found {found} {label} (fewer than the {quantity} requested): {listing}."
+        )
+
+    return f"Found {found} {label}: {listing}."
 
 
 def call_gemini(api_key: str, history_rows: list[Message], user_message: str) -> str:
@@ -290,13 +366,29 @@ def internal_chat(payload: ChatRequest, db: Session = Depends(get_db)):
     ):
         prev_meta = load_message_meta(prev_assistant)
         category = prev_meta.get("detected_category")
-        reply_text = build_import_confirmed_reply(category, quantity)
+        items: list = []
+        try:
+            preview = fetch_matterhorn_feed_items(category, quantity)
+            items = preview.get("items") if isinstance(preview.get("items"), list) else []
+            reply_text = summarize_feed_preview(category, quantity, preview)
+        except Exception as exc:
+            reply_text = (
+                f"I confirmed {quantity} {category or 'items'}, but couldn't read the "
+                f"Matterhorn feed from WordPress yet: {exc}"
+            )
+            preview = {"items": [], "error": str(exc)}
+
         persist_turn(
             db,
             payload.conversation_id,
             reply_text,
             intent="import_confirmed",
-            meta={"category": category, "quantity": quantity},
+            meta={
+                "category": category,
+                "quantity": quantity,
+                "items": items,
+                "preview": preview,
+            },
         )
         return ChatResponse(
             reply=reply_text,
