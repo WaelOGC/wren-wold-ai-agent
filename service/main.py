@@ -53,6 +53,29 @@ CATEGORY_ALIASES = (
 
 QUANTITY_RE = re.compile(r"^\s*(\d+)\s*$")
 
+CREATE_CONFIRM_PHRASES = (
+    "yes",
+    "y",
+    "ok",
+    "okay",
+    "confirm",
+    "confirmed",
+    "create",
+    "create them",
+    "create products",
+    "go ahead",
+    "do it",
+    "نعم",
+    "ايوه",
+    "أيوه",
+    "موافق",
+    "اوك",
+    "أنشئها",
+    "انشئها",
+    "انشئ",
+    "أنشئ",
+)
+
 
 class Conversation(Base):
     __tablename__ = "conversations"
@@ -155,6 +178,20 @@ def parse_quantity(message: str) -> Optional[int]:
     if not match:
         return None
     return int(match.group(1))
+
+
+def is_create_confirmation(message: str) -> bool:
+    normalized = message.strip().lower()
+    normalized = re.sub(r"[.!?,؟]+$", "", normalized).strip()
+    if not normalized:
+        return False
+    if normalized in CREATE_CONFIRM_PHRASES:
+        return True
+    return any(
+        phrase in normalized
+        for phrase in CREATE_CONFIRM_PHRASES
+        if " " in phrase or not phrase.isascii()
+    )
 
 
 def last_assistant_message(prior_messages: list[Message]) -> Optional[Message]:
@@ -355,7 +392,83 @@ def summarize_priced_preview(
     else:
         header = f"Found {found} {label}:"
 
-    return f"{header}\n{listing}"
+    return (
+        f"{header}\n{listing}\n\n"
+        "Reply yes / confirm / create them to create these as WooCommerce Draft products for admin review."
+    )
+
+
+def fetch_create_products(items: list) -> dict:
+    """POST priced items to WordPress to create WooCommerce Draft products."""
+    site_url = (os.getenv("WORDPRESS_SITE_URL") or "").rstrip("/")
+    api_key = os.getenv("WORDPRESS_API_KEY") or ""
+
+    if not site_url:
+        raise RuntimeError("WORDPRESS_SITE_URL is not configured")
+    if not api_key:
+        raise RuntimeError("WORDPRESS_API_KEY is not configured")
+
+    url = f"{site_url}/wp-json/ornina/v1/create-products"
+    payload = json.dumps({"items": items}).encode("utf-8")
+    request = urllib.request.Request(
+        url,
+        data=payload,
+        headers={
+            "X-API-Key": api_key,
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=180) as response:
+            body = response.read().decode("utf-8")
+            status = getattr(response, "status", 200)
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"WordPress create-products failed ({exc.code}): {detail}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"WordPress create-products unreachable: {exc.reason}") from exc
+
+    if status < 200 or status >= 300:
+        raise RuntimeError(f"WordPress create-products failed ({status}): {body}")
+
+    try:
+        data = json.loads(body)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("WordPress create-products returned invalid JSON") from exc
+
+    if not isinstance(data, dict):
+        raise RuntimeError("WordPress create-products returned unexpected payload")
+
+    return data
+
+
+def summarize_create_products_result(result: dict) -> str:
+    created = int(result.get("created") or 0)
+    failed = int(result.get("failed") or 0)
+    product_ids = result.get("product_ids") if isinstance(result.get("product_ids"), list) else []
+    errors = result.get("errors") if isinstance(result.get("errors"), list) else []
+
+    parts = [
+        f"Created {created} WooCommerce Draft product(s).",
+        "They need admin review before publishing.",
+    ]
+    if product_ids:
+        ids = ", ".join(str(pid) for pid in product_ids[:20])
+        parts.append(f"Product IDs: {ids}.")
+    if failed:
+        parts.append(f"{failed} item(s) failed.")
+    warnings = [
+        err.get("message")
+        for err in errors
+        if isinstance(err, dict) and err.get("message")
+    ]
+    if warnings:
+        parts.append("Notes: " + "; ".join(str(w) for w in warnings[:5]))
+
+    return " ".join(parts)
 
 
 def call_gemini(api_key: str, history_rows: list[Message], user_message: str) -> str:
@@ -455,6 +568,58 @@ def internal_chat(payload: ChatRequest, db: Session = Depends(get_db)):
 
     prev_assistant = last_assistant_message(prior_messages)
     quantity = parse_quantity(payload.message)
+
+    if (
+        prev_assistant is not None
+        and prev_assistant.intent == "import_confirmed"
+        and is_create_confirmation(payload.message)
+    ):
+        prev_meta = load_message_meta(prev_assistant)
+        items = prev_meta.get("items") if isinstance(prev_meta.get("items"), list) else []
+        if not items:
+            reply_text = (
+                "I don't have any priced products from the previous step to create. "
+                "Please run an import preview again first."
+            )
+            persist_turn(
+                db,
+                payload.conversation_id,
+                reply_text,
+                intent="create_products_confirmed",
+                meta={"items": [], "error": "no_items_in_prior_meta"},
+            )
+            return ChatResponse(
+                reply=reply_text,
+                conversation_id=payload.conversation_id,
+                intent="create_products_confirmed",
+            )
+
+        try:
+            result = fetch_create_products(items)
+            reply_text = summarize_create_products_result(result)
+        except Exception as exc:
+            result = {"created": 0, "failed": len(items), "product_ids": [], "errors": [{"message": str(exc)}]}
+            reply_text = (
+                f"I couldn't create the WooCommerce drafts: {exc}. "
+                "Nothing was published; you can try confirming again after checking WordPress."
+            )
+
+        persist_turn(
+            db,
+            payload.conversation_id,
+            reply_text,
+            intent="create_products_confirmed",
+            meta={
+                "items": items,
+                "pricing_rules": prev_meta.get("pricing_rules"),
+                "create_result": result,
+            },
+        )
+        return ChatResponse(
+            reply=reply_text,
+            conversation_id=payload.conversation_id,
+            intent="create_products_confirmed",
+        )
 
     if (
         prev_assistant is not None
