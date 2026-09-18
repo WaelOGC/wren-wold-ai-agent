@@ -96,7 +96,7 @@ def call_gemini(api_key: str, history_rows: list[Message], user_message: str) ->
         gemini_role = "user" if row.role == "user" else "model"
         history.append({"role": gemini_role, "parts": [{"text": row.content}]})
 
-    chat = client.chats.create(model="gemini-2.0-flash", history=history)
+    chat = client.chats.create(model="gemini-3.6-flash", history=history)
     response = chat.send_message(user_message)
     text = getattr(response, "text", None)
     if not text:
