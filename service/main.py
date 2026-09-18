@@ -10,6 +10,7 @@ from typing import Optional
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, Header, HTTPException
 from google import genai
+from google.genai import types
 from pydantic import BaseModel, Field
 from sqlalchemy import Column, DateTime, ForeignKey, String, Text, create_engine, text
 from sqlalchemy.orm import Session, declarative_base, relationship, sessionmaker
@@ -26,27 +27,16 @@ SessionLocal: Optional[sessionmaker] = None
 IMPORT_KEYWORDS = (
     "import",
     "importing",
-    "استورد",
-    "استيراد",
-    "يستورد",
 )
 
 # Longer phrases first so matching prefers the most specific category label.
 CATEGORY_ALIASES = (
-    ("فساتين", "dresses"),
-    ("فستان", "dresses"),
     ("dresses", "dresses"),
     ("dress", "dresses"),
-    ("تنانير", "skirts"),
-    ("تنورة", "skirts"),
     ("skirts", "skirts"),
     ("skirt", "skirts"),
-    ("بلوزات", "tops"),
-    ("بلوزة", "tops"),
     ("tops", "tops"),
     ("top", "tops"),
-    ("حقائب", "bags"),
-    ("حقيبة", "bags"),
     ("bags", "bags"),
     ("bag", "bags"),
 )
@@ -65,15 +55,17 @@ CREATE_CONFIRM_PHRASES = (
     "create products",
     "go ahead",
     "do it",
-    "نعم",
-    "ايوه",
-    "أيوه",
-    "موافق",
-    "اوك",
-    "أنشئها",
-    "انشئها",
-    "انشئ",
-    "أنشئ",
+)
+
+GENERATE_CONTENT_PHRASES = (
+    "generate content",
+    "write descriptions",
+    "generate seo",
+    "generate descriptions",
+    "write content",
+    "write seo",
+    "generate product content",
+    "write product descriptions",
 )
 
 
@@ -182,7 +174,7 @@ def parse_quantity(message: str) -> Optional[int]:
 
 def is_create_confirmation(message: str) -> bool:
     normalized = message.strip().lower()
-    normalized = re.sub(r"[.!?,؟]+$", "", normalized).strip()
+    normalized = re.sub(r"[.!?,]+$", "", normalized).strip()
     if not normalized:
         return False
     if normalized in CREATE_CONFIRM_PHRASES:
@@ -192,6 +184,14 @@ def is_create_confirmation(message: str) -> bool:
         for phrase in CREATE_CONFIRM_PHRASES
         if " " in phrase or not phrase.isascii()
     )
+
+
+def is_generate_content_request(message: str) -> bool:
+    normalized = message.strip().lower()
+    normalized = re.sub(r"[.!?,]+$", "", normalized).strip()
+    if not normalized:
+        return False
+    return any(phrase in normalized for phrase in GENERATE_CONTENT_PHRASES)
 
 
 def last_assistant_message(prior_messages: list[Message]) -> Optional[Message]:
@@ -209,6 +209,29 @@ def load_message_meta(row: Optional[Message]) -> dict:
         return data if isinstance(data, dict) else {}
     except json.JSONDecodeError:
         return {}
+
+
+def find_recent_created_product_ids(prior_messages: list[Message]) -> list[int]:
+    """Return product_ids from the most recent create_products_confirmed turn."""
+    for row in reversed(prior_messages):
+        if row.role != "assistant" or row.intent != "create_products_confirmed":
+            continue
+        meta = load_message_meta(row)
+        create_result = meta.get("create_result")
+        if not isinstance(create_result, dict):
+            continue
+        raw_ids = create_result.get("product_ids")
+        if not isinstance(raw_ids, list) or not raw_ids:
+            continue
+        ids: list[int] = []
+        for pid in raw_ids:
+            try:
+                ids.append(int(pid))
+            except (TypeError, ValueError):
+                continue
+        if ids:
+            return ids
+    return []
 
 
 def build_import_request_reply(category: Optional[str]) -> str:
@@ -471,8 +494,221 @@ def summarize_create_products_result(result: dict) -> str:
     ]
     if warnings:
         parts.append("Notes: " + "; ".join(str(w) for w in warnings[:5]))
+    if product_ids:
+        parts.append(
+            'Say "generate content" to write English names, '
+            "descriptions, and SEO from each product image."
+        )
 
     return " ".join(parts)
+
+
+def _wordpress_api_key_and_site() -> tuple[str, str]:
+    site_url = (os.getenv("WORDPRESS_SITE_URL") or "").rstrip("/")
+    api_key = os.getenv("WORDPRESS_API_KEY") or ""
+    if not site_url:
+        raise RuntimeError("WORDPRESS_SITE_URL is not configured")
+    if not api_key:
+        raise RuntimeError("WORDPRESS_API_KEY is not configured")
+    return site_url, api_key
+
+
+def _wordpress_json_request(method: str, path: str, payload: Optional[dict] = None, timeout: int = 60) -> dict:
+    site_url, api_key = _wordpress_api_key_and_site()
+    url = f"{site_url}{path}"
+    data = None
+    headers = {
+        "X-API-Key": api_key,
+        "Accept": "application/json",
+    }
+    if payload is not None:
+        data = json.dumps(payload).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+
+    request = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            body = response.read().decode("utf-8")
+            status = getattr(response, "status", 200)
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"WordPress {path} failed ({exc.code}): {detail}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"WordPress {path} unreachable: {exc.reason}") from exc
+
+    if status < 200 or status >= 300:
+        raise RuntimeError(f"WordPress {path} failed ({status}): {body}")
+
+    try:
+        parsed = json.loads(body)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"WordPress {path} returned invalid JSON") from exc
+
+    if not isinstance(parsed, dict):
+        raise RuntimeError(f"WordPress {path} returned unexpected payload")
+    return parsed
+
+
+def fetch_generate_content_context(product_id: int) -> dict:
+    """POST product_id to WordPress; returns featured image URL + product context."""
+    return _wordpress_json_request(
+        "POST",
+        "/wp-json/ornina/v1/generate-content",
+        {"product_id": int(product_id)},
+        timeout=60,
+    )
+
+
+def fetch_apply_content(product_id: int, content: dict) -> dict:
+    """Apply AI-generated title/description/SEO to a WooCommerce product."""
+    payload = {
+        "product_id": int(product_id),
+        "name": content.get("name") or "",
+        "description": content.get("description") or "",
+        "short_description": content.get("short_description") or "",
+        "seo_title": content.get("seo_title") or "",
+        "seo_meta_description": content.get("seo_meta_description") or "",
+    }
+    return _wordpress_json_request(
+        "POST",
+        "/wp-json/ornina/v1/apply-content",
+        payload,
+        timeout=60,
+    )
+
+
+def _guess_image_mime(url: str, content_type: str | None) -> str:
+    if content_type:
+        mime = content_type.split(";")[0].strip().lower()
+        if mime.startswith("image/"):
+            return mime
+    lowered = (url or "").lower().split("?")[0]
+    if lowered.endswith(".png"):
+        return "image/png"
+    if lowered.endswith(".webp"):
+        return "image/webp"
+    if lowered.endswith(".gif"):
+        return "image/gif"
+    return "image/jpeg"
+
+
+def _fetch_image_bytes(image_url: str) -> tuple[bytes, str]:
+    request = urllib.request.Request(
+        image_url,
+        headers={"User-Agent": "OrninaContentGen/1.0", "Accept": "image/*,*/*"},
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            data = response.read()
+            content_type = response.headers.get("Content-Type")
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(f"Failed to download product image ({exc.code})") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"Failed to download product image: {exc.reason}") from exc
+
+    if not data:
+        raise RuntimeError("Product image download returned empty body")
+    return data, _guess_image_mime(image_url, content_type)
+
+
+def parse_gemini_content_json(raw_text: str) -> dict:
+    """Parse Gemini JSON output; strip markdown fences if present."""
+    text = (raw_text or "").strip()
+    if not text:
+        raise RuntimeError("Gemini returned empty content")
+
+    fence = re.match(r"^```(?:json)?\s*([\s\S]*?)\s*```$", text, re.IGNORECASE)
+    if fence:
+        text = fence.group(1).strip()
+    else:
+        # Tolerate leading/trailing prose around a JSON object.
+        start = text.find("{")
+        end = text.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            text = text[start : end + 1]
+
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Gemini returned invalid JSON: {exc}") from exc
+
+    if not isinstance(data, dict):
+        raise RuntimeError("Gemini JSON was not an object")
+
+    required = ("name", "description", "short_description", "seo_title", "seo_meta_description")
+    missing = [key for key in required if key not in data]
+    if missing:
+        raise RuntimeError(f"Gemini JSON missing keys: {', '.join(missing)}")
+
+    return {
+        "name": str(data.get("name") or "").strip(),
+        "description": str(data.get("description") or "").strip(),
+        "short_description": str(data.get("short_description") or "").strip(),
+        "seo_title": str(data.get("seo_title") or "").strip(),
+        "seo_meta_description": str(data.get("seo_meta_description") or "").strip(),
+    }
+
+
+def generate_product_content(
+    api_key: str,
+    image_url: str,
+    category: str = "",
+    model_number: str = "",
+) -> dict:
+    """Call Gemini vision once to produce English product name/description/SEO JSON."""
+    if not image_url:
+        raise RuntimeError("Product has no featured image URL")
+
+    image_bytes, mime_type = _fetch_image_bytes(image_url)
+
+    category_line = category.strip() if category else "women's fashion"
+    model_line = model_number.strip() if model_number else "unknown"
+
+    prompt = (
+        "You are a fashion e-commerce copywriter for a European women's fashion store. "
+        "Analyze the product image and write storefront copy in English.\n"
+        f"Category context: {category_line}\n"
+        f"Supplier model number (for your awareness only, do not put raw codes in the title): {model_line}\n\n"
+        "Return ONLY valid JSON with these exact keys:\n"
+        '- "name": concise professional English product title, max ~70 characters\n'
+        '- "description": 2-3 paragraph English product description, warm brand tone\n'
+        '- "short_description": 1 sentence summary\n'
+        '- "seo_title": English SEO title, max 60 characters\n'
+        '- "seo_meta_description": English meta description, max 155 characters\n'
+        "Do not wrap the JSON in markdown. Do not include any other keys or commentary."
+    )
+
+    client = genai.Client(api_key=api_key)
+    response = client.models.generate_content(
+        model="gemini-3.6-flash",
+        contents=[
+            types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
+            prompt,
+        ],
+    )
+    text_out = getattr(response, "text", None)
+    if not text_out:
+        raise RuntimeError("Gemini returned an empty response")
+    return parse_gemini_content_json(text_out)
+
+
+def summarize_generate_content_result(updated: list[dict], failures: list[dict]) -> str:
+    parts = [f"Updated content for {len(updated)} product(s)."]
+    if updated:
+        lines = []
+        for row in updated:
+            pid = row.get("product_id")
+            name = row.get("name") or "(unnamed)"
+            lines.append(f"#{pid}: {name}")
+        parts.append("New English names:\n" + "\n".join(lines))
+        parts.append("Review the Draft products in WooCommerce before publishing.")
+    if failures:
+        fail_lines = []
+        for row in failures[:10]:
+            fail_lines.append(f"#{row.get('product_id')}: {row.get('error')}")
+        parts.append(f"{len(failures)} failed:\n" + "\n".join(fail_lines))
+    return "\n\n".join(parts)
 
 
 def call_gemini(api_key: str, history_rows: list[Message], user_message: str) -> str:
@@ -623,6 +859,71 @@ def internal_chat(payload: ChatRequest, db: Session = Depends(get_db)):
             reply=reply_text,
             conversation_id=payload.conversation_id,
             intent="create_products_confirmed",
+        )
+
+    if is_generate_content_request(payload.message):
+        product_ids = find_recent_created_product_ids(prior_messages)
+        if not product_ids:
+            reply_text = (
+                "I don't have any recently created product IDs to generate content for. "
+                "Import and create Draft products first, then say \"generate content\"."
+            )
+            persist_turn(
+                db,
+                payload.conversation_id,
+                reply_text,
+                intent="generate_content_requested",
+                meta={"product_ids": [], "error": "no_recent_product_ids"},
+            )
+            return ChatResponse(
+                reply=reply_text,
+                conversation_id=payload.conversation_id,
+                intent="generate_content_requested",
+            )
+
+        updated: list[dict] = []
+        failures: list[dict] = []
+        for product_id in product_ids:
+            try:
+                context = fetch_generate_content_context(product_id)
+                image_url = str(context.get("featured_image_url") or "")
+                category = str(context.get("category") or "")
+                model_number = str(
+                    context.get("model_number") or context.get("model") or ""
+                )
+                content = generate_product_content(
+                    payload.gemini_api_key,
+                    image_url,
+                    category=category,
+                    model_number=model_number,
+                )
+                apply_result = fetch_apply_content(product_id, content)
+                product_summary = (
+                    apply_result.get("product")
+                    if isinstance(apply_result.get("product"), dict)
+                    else {}
+                )
+                new_name = str(product_summary.get("name") or content.get("name") or "")
+                updated.append({"product_id": product_id, "name": new_name})
+            except Exception as exc:
+                failures.append({"product_id": product_id, "error": str(exc)})
+
+        reply_text = summarize_generate_content_result(updated, failures)
+        persist_turn(
+            db,
+            payload.conversation_id,
+            reply_text,
+            intent="generate_content_requested",
+            meta={
+                "product_ids": product_ids,
+                "updated": updated,
+                "failures": failures,
+            },
+        )
+        return ChatResponse(
+            reply=reply_text,
+            conversation_id=payload.conversation_id,
+            intent="generate_content_requested",
         )
 
     if (
