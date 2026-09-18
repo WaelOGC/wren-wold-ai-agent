@@ -32,6 +32,16 @@ function ornina_register_rest_routes() {
 			),
 		)
 	);
+
+	register_rest_route(
+		'ornina/v1',
+		'/pricing-rules',
+		array(
+			'methods'             => 'GET',
+			'callback'            => 'ornina_rest_pricing_rules',
+			'permission_callback' => 'ornina_rest_verify_api_key',
+		)
+	);
 }
 add_action( 'rest_api_init', 'ornina_register_rest_routes' );
 
@@ -77,4 +87,23 @@ function ornina_rest_matterhorn_feed_preview( $request ) {
 	}
 
 	return rest_ensure_response( $result );
+}
+
+/**
+ * GET /wp-json/ornina/v1/pricing-rules
+ *
+ * @param WP_REST_Request $request Request.
+ * @return WP_REST_Response
+ */
+function ornina_rest_pricing_rules( $request ) {
+	unset( $request );
+
+	return rest_ensure_response(
+		array(
+			'default_margin_percent' => (float) get_option( 'ornina_default_margin_percent', 40 ),
+			'default_shipping_cost'  => (float) get_option( 'ornina_default_shipping_cost', 9.9 ),
+			'payment_fee_percent'    => (float) get_option( 'ornina_payment_fee_percent', 2.9 ),
+			'payment_fee_fixed'      => (float) get_option( 'ornina_payment_fee_fixed', 0.3 ),
+		)
+	);
 }

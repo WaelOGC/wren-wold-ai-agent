@@ -232,33 +232,130 @@ def fetch_matterhorn_feed_items(category: Optional[str], quantity: int) -> dict:
     return data
 
 
-def summarize_feed_preview(category: Optional[str], quantity: int, preview: dict) -> str:
-    items = preview.get("items") if isinstance(preview.get("items"), list) else []
-    found = int(preview.get("found") or len(items))
+DEFAULT_PRICING_RULES = {
+    "default_margin_percent": 40.0,
+    "default_shipping_cost": 9.90,
+    "payment_fee_percent": 2.9,
+    "payment_fee_fixed": 0.30,
+}
+
+
+def fetch_pricing_rules() -> dict:
+    """Fetch pricing rules from WordPress; fall back to defaults on failure."""
+    site_url = (os.getenv("WORDPRESS_SITE_URL") or "").rstrip("/")
+    api_key = os.getenv("WORDPRESS_API_KEY") or ""
+    fallback = dict(DEFAULT_PRICING_RULES)
+
+    if not site_url or not api_key:
+        return fallback
+
+    url = f"{site_url}/wp-json/ornina/v1/pricing-rules"
+    request = urllib.request.Request(
+        url,
+        headers={
+            "X-API-Key": api_key,
+            "Accept": "application/json",
+        },
+        method="GET",
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            body = response.read().decode("utf-8")
+            status = getattr(response, "status", 200)
+            if status < 200 or status >= 300:
+                return fallback
+            data = json.loads(body)
+    except (urllib.error.URLError, urllib.error.HTTPError, json.JSONDecodeError, TimeoutError):
+        return fallback
+
+    if not isinstance(data, dict):
+        return fallback
+
+    return {
+        "default_margin_percent": float(
+            data.get("default_margin_percent", fallback["default_margin_percent"])
+        ),
+        "default_shipping_cost": float(
+            data.get("default_shipping_cost", fallback["default_shipping_cost"])
+        ),
+        "payment_fee_percent": float(
+            data.get("payment_fee_percent", fallback["payment_fee_percent"])
+        ),
+        "payment_fee_fixed": float(
+            data.get("payment_fee_fixed", fallback["payment_fee_fixed"])
+        ),
+    }
+
+
+def _money(value: float) -> float:
+    return round(float(value), 2)
+
+
+def calculate_item_pricing(item: dict, rules: dict) -> dict:
+    """Apply Ornina pricing rules to a single feed item."""
+    cost = _money(item.get("price") or 0)
+    shipping = _money(rules.get("default_shipping_cost", 9.90))
+    fee_percent = float(rules.get("payment_fee_percent", 2.9))
+    fee_fixed = _money(rules.get("payment_fee_fixed", 0.30))
+    margin_percent = float(rules.get("default_margin_percent", 40.0))
+
+    total_cost = _money(cost + shipping)
+    payment_fee = _money((cost * fee_percent / 100.0) + fee_fixed)
+
+    denom = 1.0 - (margin_percent / 100.0)
+    if denom <= 0:
+        sale_price = _money(total_cost + payment_fee)
+    else:
+        sale_price = _money((total_cost + payment_fee) / denom)
+
+    profit = _money(sale_price - total_cost - payment_fee)
+
+    priced = dict(item)
+    priced.update(
+        {
+            "cost": cost,
+            "shipping": shipping,
+            "total_cost": total_cost,
+            "payment_fee": payment_fee,
+            "sale_price": sale_price,
+            "profit": profit,
+            "margin_percent": margin_percent,
+            "payment_fee_percent": fee_percent,
+            "payment_fee_fixed": fee_fixed,
+        }
+    )
+    return priced
+
+
+def summarize_priced_preview(
+    category: Optional[str],
+    quantity: int,
+    priced_items: list,
+) -> str:
+    found = len(priced_items)
     label = category if category else "items"
 
     if found == 0:
         return f"I couldn't find any {label} in the Matterhorn feed right now."
 
     lines = []
-    for item in items[:quantity]:
-        if not isinstance(item, dict):
-            continue
+    for item in priced_items[:quantity]:
         name = str(item.get("name") or item.get("model") or "Unknown")
-        price = item.get("price")
-        if isinstance(price, (int, float)):
-            lines.append(f"{name} (€{price:g} cost)")
-        else:
-            lines.append(name)
-
-    listing = "; ".join(lines) if lines else "no details available"
-
-    if found < quantity:
-        return (
-            f"Found {found} {label} (fewer than the {quantity} requested): {listing}."
+        model = str(item.get("model") or "").strip()
+        label_name = f"{name} model {model}" if model and model.lower() not in name.lower() else name
+        lines.append(
+            f"{label_name} — cost €{item['cost']:.2f}, "
+            f"sale price €{item['sale_price']:.2f}, profit €{item['profit']:.2f}"
         )
 
-    return f"Found {found} {label}: {listing}."
+    listing = "\n".join(lines)
+    if found < quantity:
+        header = f"Found {found} {label} (fewer than the {quantity} requested):"
+    else:
+        header = f"Found {found} {label}:"
+
+    return f"{header}\n{listing}"
 
 
 def call_gemini(api_key: str, history_rows: list[Message], user_message: str) -> str:
@@ -366,11 +463,17 @@ def internal_chat(payload: ChatRequest, db: Session = Depends(get_db)):
     ):
         prev_meta = load_message_meta(prev_assistant)
         category = prev_meta.get("detected_category")
-        items: list = []
+        priced_items: list = []
+        pricing_rules = fetch_pricing_rules()
         try:
             preview = fetch_matterhorn_feed_items(category, quantity)
-            items = preview.get("items") if isinstance(preview.get("items"), list) else []
-            reply_text = summarize_feed_preview(category, quantity, preview)
+            raw_items = preview.get("items") if isinstance(preview.get("items"), list) else []
+            priced_items = [
+                calculate_item_pricing(item, pricing_rules)
+                for item in raw_items
+                if isinstance(item, dict)
+            ]
+            reply_text = summarize_priced_preview(category, quantity, priced_items)
         except Exception as exc:
             reply_text = (
                 f"I confirmed {quantity} {category or 'items'}, but couldn't read the "
@@ -386,7 +489,8 @@ def internal_chat(payload: ChatRequest, db: Session = Depends(get_db)):
             meta={
                 "category": category,
                 "quantity": quantity,
-                "items": items,
+                "pricing_rules": pricing_rules,
+                "items": priced_items,
                 "preview": preview,
             },
         )

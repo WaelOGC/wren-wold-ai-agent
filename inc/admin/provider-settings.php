@@ -130,8 +130,109 @@ function ornina_register_provider_settings() {
 		'ornina-settings',
 		'ornina_backend_section'
 	);
+
+	$pricing_fields = array(
+		'ornina_default_margin_percent' => array(
+			'label'   => __( 'Default Profit Margin (%)', 'wren-wold-ai-agent' ),
+			'default' => 40,
+			'step'    => '0.1',
+		),
+		'ornina_default_shipping_cost'  => array(
+			'label'   => __( 'Default Shipping Cost (EUR)', 'wren-wold-ai-agent' ),
+			'default' => 9.9,
+			'step'    => '0.01',
+		),
+		'ornina_payment_fee_percent'    => array(
+			'label'   => __( 'Payment Processor Fee (%)', 'wren-wold-ai-agent' ),
+			'default' => 2.9,
+			'step'    => '0.1',
+		),
+		'ornina_payment_fee_fixed'      => array(
+			'label'   => __( 'Payment Processor Fixed Fee (EUR)', 'wren-wold-ai-agent' ),
+			'default' => 0.3,
+			'step'    => '0.01',
+		),
+	);
+
+	foreach ( $pricing_fields as $option => $config ) {
+		register_setting(
+			'ornina_provider_settings',
+			$option,
+			array(
+				'type'              => 'number',
+				'sanitize_callback' => 'ornina_sanitize_float_option',
+				'default'           => $config['default'],
+			)
+		);
+	}
+
+	add_settings_section(
+		'ornina_pricing_section',
+		__( 'Pricing Rules', 'wren-wold-ai-agent' ),
+		'ornina_render_pricing_section_description',
+		'ornina-settings'
+	);
+
+	foreach ( $pricing_fields as $option => $config ) {
+		add_settings_field(
+			$option,
+			$config['label'],
+			'ornina_render_pricing_number_field',
+			'ornina-settings',
+			'ornina_pricing_section',
+			array(
+				'option'  => $option,
+				'default' => $config['default'],
+				'step'    => $config['step'],
+			)
+		);
+	}
 }
 add_action( 'admin_init', 'ornina_register_provider_settings' );
+
+/**
+ * Sanitize a decimal settings value.
+ *
+ * @param mixed $value Raw value.
+ * @return float
+ */
+function ornina_sanitize_float_option( $value ) {
+	if ( is_string( $value ) ) {
+		$value = str_replace( ',', '.', trim( $value ) );
+	}
+
+	return round( (float) $value, 4 );
+}
+
+/**
+ * Pricing Rules section intro.
+ */
+function ornina_render_pricing_section_description() {
+	echo '<p>' . esc_html__( 'Used by Ornina when suggesting sale prices from Matterhorn cost prices. No products are created until a later phase.', 'wren-wold-ai-agent' ) . '</p>';
+}
+
+/**
+ * Render a numeric pricing settings field.
+ *
+ * @param array $args Field args (option, default, step).
+ */
+function ornina_render_pricing_number_field( $args ) {
+	$option  = isset( $args['option'] ) ? (string) $args['option'] : '';
+	$default = isset( $args['default'] ) ? $args['default'] : 0;
+	$step    = isset( $args['step'] ) ? (string) $args['step'] : '0.01';
+	$value   = get_option( $option, $default );
+	?>
+	<input
+		type="number"
+		name="<?php echo esc_attr( $option ); ?>"
+		id="<?php echo esc_attr( $option ); ?>"
+		value="<?php echo esc_attr( (string) $value ); ?>"
+		class="small-text"
+		step="<?php echo esc_attr( $step ); ?>"
+		min="0"
+	/>
+	<?php
+}
 
 /**
  * Provider slug => label map.
