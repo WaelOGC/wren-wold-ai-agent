@@ -28,9 +28,11 @@ This mirrors the existing "Amy Agent" pattern already in production for the OGC 
   - These are architecturally distinct — not the same endpoints with a permission flag — so a bug in one cannot expose the other's data.
 
 ## AI Provider
-- **Model**: Google Gemini (existing account/billing already in place).
-- **Web search / market research**: Gemini's built-in Grounding with Google Search — no separate search API integration needed.
-- **Image analysis**: Gemini's multimodal capability, used for analyzing Matterhorn product photos to generate names/descriptions/SEO.
+- **Provider keys management**: All AI provider API keys are entered and stored via a dedicated settings screen inside the WordPress admin dashboard (plugin settings page) — never hardcoded in the Python service's `.env`. WordPress is the source of truth for these keys.
+- **Key delivery to Python**: The Python backend retrieves the active provider key(s) from WordPress via an authenticated `/internal/*` API call (using the shared API key), rather than reading them from local environment variables. This lets the owner add, rotate, or switch providers at any time without redeploying the backend.
+- **Supported providers**: Google Gemini, OpenAI (GPT), Anthropic (Claude), DeepSeek, Mistral, and xAI (Grok). Each provider's key is stored and labeled separately; the owner selects which provider is active for a given task/sub-agent.
+- **Web search / market research**: Uses whichever active provider's built-in web-search/grounding capability is available (e.g. Gemini's Grounding with Google Search, xAI's X/Twitter trend access for Grok).
+- **Image analysis**: Uses the active provider's multimodal capability (e.g. Gemini or GPT-4o-class models) for analyzing Matterhorn product photos.
 
 ## Sub-Agent Structure
 Ornina (orchestrator) delegates to specialized sub-agents, each scoped to a domain:
