@@ -378,11 +378,15 @@ def summarize_priced_preview(
 
     lines = []
     for item in priced_items[:quantity]:
-        name = str(item.get("name") or item.get("model") or "Unknown")
-        model = str(item.get("model") or "").strip()
-        label_name = f"{name} model {model}" if model and model.lower() not in name.lower() else name
+        # Prefer exact feed <name> for Matterhorn-searchable reference in chat.
+        name = str(
+            item.get("matterhorn_original_name")
+            or item.get("name")
+            or item.get("model")
+            or "Unknown"
+        )
         lines.append(
-            f"{label_name} — cost €{item['cost']:.2f}, "
+            f"{name} — cost €{item['cost']:.2f}, "
             f"sale price €{item['sale_price']:.2f}, profit €{item['profit']:.2f}"
         )
 

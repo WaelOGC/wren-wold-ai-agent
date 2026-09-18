@@ -2330,13 +2330,17 @@ function fashion_brand_theme_matterhorn_preview_category_items( $category, $quan
 
 		$first   = $variants[0];
 		$items[] = array(
-			'name'       => fashion_brand_theme_matterhorn_style_display_name( $first['name'], $first['color'] ),
-			'model'      => (string) $group['style_key'],
-			'category'   => (string) $group['category'],
-			'colors'     => array_values( array_unique( $colors ) ),
-			'sizes'      => array_keys( $all_sizes ),
-			'price'      => (float) $first['price_netto'],
-			'image_urls' => array_values( array_unique( $image_urls ) ),
+			// Storefront/working display name (color stripped). Not for Matterhorn site search.
+			'name'                      => fashion_brand_theme_matterhorn_style_display_name( $first['name'], $first['color'] ),
+			// Exact feed <name> — the only string Matterhorn's own search accepts.
+			'matterhorn_original_name'  => (string) $first['name'],
+			// Style key derived from feed <code> (SKU-ish), not the "model NNN" number in <name>.
+			'model'                     => (string) $group['style_key'],
+			'category'                  => (string) $group['category'],
+			'colors'                    => array_values( array_unique( $colors ) ),
+			'sizes'                     => array_keys( $all_sizes ),
+			'price'                     => (float) $first['price_netto'],
+			'image_urls'                => array_values( array_unique( $image_urls ) ),
 		);
 
 		if ( count( $items ) >= $quantity ) {

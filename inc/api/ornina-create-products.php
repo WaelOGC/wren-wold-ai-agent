@@ -304,9 +304,33 @@ function ornina_create_draft_product_from_item( array $item ) {
 
 	wp_set_object_terms( $product_id, array( (int) $category_term_id ), 'product_cat' );
 
+	// Permanent Matterhorn reference: exact feed <name>, set once, never overwritten.
+	$original_name = '';
+	if ( isset( $item['matterhorn_original_name'] ) ) {
+		$original_name = trim( (string) $item['matterhorn_original_name'] );
+	}
+	if ( '' === $original_name ) {
+		// Fallback for older payloads that only sent the display name.
+		$original_name = $name;
+	}
+	$existing_original = (string) $product->get_meta( '_ornina_matterhorn_original_name', true );
+	if ( '' === $existing_original && '' !== $original_name ) {
+		$product->update_meta_data( '_ornina_matterhorn_original_name', $original_name );
+	}
+
 	$product->update_meta_data( '_ornina_cost', null !== $cost ? wc_format_decimal( $cost, 2 ) : '' );
 	$product->update_meta_data( '_ornina_profit', null !== $profit ? wc_format_decimal( $profit, 2 ) : '' );
 	$product->update_meta_data( '_ornina_model', $model );
+
+	// Model number embedded in feed <name> (e.g. "Avondjurk model 107269 Tessita"), distinct from style_key.
+	$model_number = ornina_extract_matterhorn_model_number( $original_name );
+	if ( '' !== $model_number ) {
+		$existing_model_number = (string) $product->get_meta( '_ornina_matterhorn_model_number', true );
+		if ( '' === $existing_model_number ) {
+			$product->update_meta_data( '_ornina_matterhorn_model_number', $model_number );
+		}
+	}
+
 	$product->update_meta_data( '_ornina_source_category', $category );
 
 	$short_bits = array();
@@ -499,4 +523,18 @@ function ornina_unique_sku( $model ) {
 	}
 
 	return $sku;
+}
+
+/**
+ * Extract a numeric model number from a Matterhorn feed <name> (e.g. "… model 107269 …").
+ *
+ * @param string $original_name Exact feed <name>.
+ * @return string Digits only, or empty string.
+ */
+function ornina_extract_matterhorn_model_number( $original_name ) {
+	if ( preg_match( '/\bmodel\s+(\d+)\b/iu', (string) $original_name, $matches ) ) {
+		return (string) $matches[1];
+	}
+
+	return '';
 }
