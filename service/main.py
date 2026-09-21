@@ -33,6 +33,13 @@ IMPORT_KEYWORDS = (
 CATEGORY_ALIASES = (
     ("dresses", "dresses"),
     ("dress", "dresses"),
+    ("t-shirts", "t-shirts"),
+    ("t-shirt", "t-shirts"),
+    ("shirts", "shirts"),
+    ("shirt", "shirts"),
+    ("pants", "pants"),
+    ("pant", "pants"),
+    ("knitwear", "knitwear"),
     ("skirts", "skirts"),
     ("skirt", "skirts"),
     ("tops", "tops"),
@@ -250,7 +257,10 @@ def fetch_matterhorn_feed_items(category: Optional[str], quantity: int) -> dict:
     if not api_key:
         raise RuntimeError("WORDPRESS_API_KEY is not configured")
 
-    category_param = category or "dresses"
+    if category is None or str(category).strip() == "":
+        raise ValueError("A category is required to query the Matterhorn feed.")
+
+    category_param = str(category).strip()
     query = urllib.parse.urlencode(
         {
             "category": category_param,
@@ -974,6 +984,25 @@ def internal_chat(payload: ChatRequest, db: Session = Depends(get_db)):
 
     if is_import_request(payload.message):
         detected_category = extract_category(payload.message)
+        if detected_category is None:
+            reply_text = (
+                "Which category would you like to import? "
+                "Please choose one of: Dresses, T-Shirts, Shirts, Pants, Knitwear, Skirts, Bags."
+            )
+            persist_turn(
+                db,
+                payload.conversation_id,
+                reply_text,
+                intent="import_category_unclear",
+                meta={"raw_message": payload.message},
+            )
+            return ChatResponse(
+                reply=reply_text,
+                conversation_id=payload.conversation_id,
+                intent="import_category_unclear",
+                detected_category=None,
+            )
+
         reply_text = build_import_request_reply(detected_category)
         persist_turn(
             db,
