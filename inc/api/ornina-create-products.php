@@ -265,6 +265,17 @@ function ornina_create_draft_product_from_item( array $item ) {
 		}
 	}
 
+	$color_images = array();
+	if ( ! empty( $item['color_images'] ) && is_array( $item['color_images'] ) ) {
+		foreach ( $item['color_images'] as $color => $url ) {
+			$color = trim( (string) $color );
+			$url   = trim( (string) $url );
+			if ( '' !== $color && '' !== $url ) {
+				$color_images[ $color ] = $url;
+			}
+		}
+	}
+
 	$category_term_id = ornina_ensure_product_category( $category );
 	if ( is_wp_error( $category_term_id ) ) {
 		return $category_term_id;
@@ -284,7 +295,8 @@ function ornina_create_draft_product_from_item( array $item ) {
 				$model,
 				$sale_price,
 				$colors,
-				$sizes
+				$sizes,
+				$color_images
 			);
 		} else {
 			$product_id = ornina_create_draft_simple_product( $display_name, $model, $sale_price );
@@ -332,23 +344,6 @@ function ornina_create_draft_product_from_item( array $item ) {
 	}
 
 	$product->update_meta_data( '_ornina_source_category', $category );
-
-	$short_bits = array();
-	if ( null !== $cost ) {
-		$short_bits[] = sprintf( 'Cost: €%s', wc_format_decimal( $cost, 2 ) );
-	}
-	if ( null !== $profit ) {
-		$short_bits[] = sprintf( 'Profit: €%s', wc_format_decimal( $profit, 2 ) );
-	}
-	if ( '' !== $model ) {
-		$short_bits[] = 'Model: ' . $model;
-	}
-	if ( '' !== $category ) {
-		$short_bits[] = 'Category: ' . $category;
-	}
-	if ( $short_bits ) {
-		$product->set_short_description( implode( ' · ', $short_bits ) );
-	}
 
 	$product->set_status( 'draft' );
 	$product->save();
@@ -403,14 +398,15 @@ function ornina_create_draft_simple_product( $name, $model, $sale_price ) {
  * - colors only → variations on pa_color
  * - both        → variations on pa_color × pa_size
  *
- * @param string        $name       Product name.
- * @param string        $model      Model / SKU base.
- * @param string        $sale_price Formatted regular price for every variation.
- * @param array<int,string> $colors Color labels.
- * @param array<int,string> $sizes  Size labels.
+ * @param string             $name         Product name.
+ * @param string             $model        Model / SKU base.
+ * @param string             $sale_price   Formatted regular price for every variation.
+ * @param array<int,string>  $colors       Color labels.
+ * @param array<int,string>  $sizes        Size labels.
+ * @param array<string,string> $color_images Optional map of color label => image URL.
  * @return int Parent product ID.
  */
-function ornina_create_draft_variable_product( $name, $model, $sale_price, array $colors, array $sizes ) {
+function ornina_create_draft_variable_product( $name, $model, $sale_price, array $colors, array $sizes, array $color_images = array() ) {
 	$product = new WC_Product_Variable();
 	$product->set_name( $name );
 	$product->set_status( 'draft' );
@@ -474,6 +470,24 @@ function ornina_create_draft_variable_product( $name, $model, $sale_price, array
 		wp_set_object_terms( $parent_id, $size_slugs, 'pa_size' );
 	}
 
+	// Sideload one image per color (keyed by pa_color slug) for variation assignment.
+	$color_attachment_by_slug = array();
+	foreach ( $color_images as $color_label => $image_url ) {
+		$color_label = trim( (string) $color_label );
+		$image_url   = trim( (string) $image_url );
+		if ( '' === $color_label || '' === $image_url ) {
+			continue;
+		}
+		$slug = fashion_brand_theme_matterhorn_ensure_term( 'pa_color', $color_label );
+		if ( '' === $slug || isset( $color_attachment_by_slug[ $slug ] ) ) {
+			continue;
+		}
+		$attachment_id = fashion_brand_theme_matterhorn_sideload_image( $image_url, $parent_id );
+		if ( $attachment_id > 0 ) {
+			$color_attachment_by_slug[ $slug ] = $attachment_id;
+		}
+	}
+
 	$color_axis = ! empty( $color_slugs ) ? $color_slugs : array( '' );
 	$size_axis  = ! empty( $size_slugs ) ? $size_slugs : array( '' );
 
@@ -494,6 +508,11 @@ function ornina_create_draft_variable_product( $name, $model, $sale_price, array
 			$variation->set_manage_stock( false );
 			$variation->set_stock_status( 'instock' );
 			$variation->set_status( 'publish' );
+
+			if ( '' !== $color_slug && isset( $color_attachment_by_slug[ $color_slug ] ) ) {
+				$variation->set_image_id( $color_attachment_by_slug[ $color_slug ] );
+			}
+
 			$variation->save();
 		}
 	}

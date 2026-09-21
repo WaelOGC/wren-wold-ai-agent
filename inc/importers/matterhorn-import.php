@@ -2345,12 +2345,23 @@ function fashion_brand_theme_matterhorn_preview_category_items( $category, $quan
 			continue;
 		}
 
-		$colors     = array();
-		$all_sizes  = array();
-		$image_urls = array();
+		$colors       = array();
+		$all_sizes    = array();
+		$image_urls   = array();
+		$color_images = array();
 		foreach ( $variants as $variant ) {
-			if ( ! empty( $variant['color'] ) ) {
-				$colors[] = (string) $variant['color'];
+			$color = ! empty( $variant['color'] ) ? (string) $variant['color'] : '';
+			if ( '' !== $color ) {
+				$colors[] = $color;
+				if ( ! isset( $color_images[ $color ] ) ) {
+					foreach ( $variant['photos'] as $photo ) {
+						$photo = trim( (string) $photo );
+						if ( '' !== $photo ) {
+							$color_images[ $color ] = $photo;
+							break;
+						}
+					}
+				}
 			}
 			foreach ( $variant['sizes'] as $size ) {
 				$all_sizes[ $size['name'] ] = true;
@@ -2382,6 +2393,7 @@ function fashion_brand_theme_matterhorn_preview_category_items( $category, $quan
 			'sizes'                     => array_keys( $all_sizes ),
 			'price'                     => (float) $first['price_netto'],
 			'image_urls'                => array_values( array_unique( $image_urls ) ),
+			'color_images'              => $color_images,
 		);
 
 		if ( count( $items ) >= $quantity ) {
