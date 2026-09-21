@@ -2194,6 +2194,41 @@ function fashion_brand_theme_matterhorn_existing_map( array $product_ids ) {
 }
 
 /**
+ * Whether a Matterhorn style_key already exists as a WooCommerce product (_ornina_model).
+ *
+ * Trashed and auto-draft products are ignored so those style keys can be re-imported.
+ *
+ * @param string $style_key Feed style key (stored as product meta _ornina_model).
+ * @return bool
+ */
+function fashion_brand_theme_matterhorn_style_key_already_imported( $style_key ) {
+	$style_key = trim( (string) $style_key );
+	if ( '' === $style_key ) {
+		return false;
+	}
+
+	$query = new WP_Query(
+		array(
+			'post_type'              => 'product',
+			'post_status'            => array( 'publish', 'draft', 'pending', 'future', 'private' ),
+			'posts_per_page'         => 1,
+			'fields'                 => 'ids',
+			'no_found_rows'          => true,
+			'update_post_meta_cache' => false,
+			'update_post_term_cache' => false,
+			'meta_query'             => array(
+				array(
+					'key'   => '_ornina_model',
+					'value' => $style_key,
+				),
+			),
+		)
+	);
+
+	return ! empty( $query->posts );
+}
+
+/**
  * Read-only: stream the Matterhorn XML feed and return up to $quantity products
  * matching a canonical category slug (e.g. dresses). Does not create Woo products.
  *
@@ -2329,6 +2364,12 @@ function fashion_brand_theme_matterhorn_preview_category_items( $category, $quan
 		}
 
 		$first   = $variants[0];
+
+		// Skip styles already imported as WooCommerce products (any non-trash status).
+		if ( fashion_brand_theme_matterhorn_style_key_already_imported( (string) $group['style_key'] ) ) {
+			continue;
+		}
+
 		$items[] = array(
 			// Storefront/working display name (color stripped). Not for Matterhorn site search.
 			'name'                      => fashion_brand_theme_matterhorn_style_display_name( $first['name'], $first['color'] ),
